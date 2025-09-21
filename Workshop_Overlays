@@ -1,0 +1,155 @@
+import cv2
+import mediapipe as mp
+import numpy as np
+from collections import deque
+
+# Initialize MediaPipe Holistic
+mp_holistic = mp.solutions.holistic
+
+# Configuration
+overlay_enabled = True
+trails_enabled = True
+box_opacity = 0.6
+trail_length = 10
+visible_group_count = 1  # Starts with the most essential body part only
+
+# Ranked list of body part groups
+RANKED_GROUPS = [
+    'torso',
+    'head',
+    'left_arm',
+    'right_arm',
+    'left_hand',
+    'right_hand',
+    'left_leg',
+    'right_leg',
+    'left_eye',
+    'right_eye',
+    'mouth',
+    'chin',
+    'hips'
+]
+
+# Landmark definitions for each group
+GROUPS = {
+    'head': [0, 1, 2, 3, 4, 5, 6, 7, 8],
+    'left_eye': [1],
+    'right_eye': [2],
+    'mouth': [9, 10],
+    'chin': [152, 234],
+    'left_hand': [15, 17, 19, 21],
+    'right_hand': [16, 18, 20, 22],
+    'left_arm': [11, 13, 15],
+    'right_arm': [12, 14, 16],
+    'left_leg': [23, 25, 27],
+    'right_leg': [24, 26, 28],
+    'torso': [11, 12, 23, 24],
+    'hips': [23, 24]
+}
+
+# Color coding for each group
+GROUP_COLORS = {
+    'head': (255, 255, 255),
+    'left_eye': (100, 255, 255),
+    'right_eye': (100, 255, 255),
+    'mouth': (255, 100, 100),
+    'chin': (200, 150, 150),
+    'left_hand': (0, 255, 0),
+    'right_hand': (0, 200, 0),
+    'left_arm': (0, 255, 255),
+    'right_arm': (0, 200, 200),
+    'left_leg': (255, 0, 0),
+    'right_leg': (200, 0, 0),
+    'torso': (255, 255, 0),
+    'hips': (150, 150, 0)
+}
+
+landmark_history = {k: deque(maxlen=trail_length) for k in GROUPS}
+
+def get_group_box(landmarks, indices, image_shape):
+    h, w, _ = image_shape
+    xs, ys = [], []
+    for idx in indices:
+        if idx >= len(landmarks):
+            continue
+        lm = landmarks[idx]
+        if hasattr(lm, 'visibility') and lm.visibility < 0.5:
+            continue
+        xs.append(int(lm.x * w))
+        ys.append(int(lm.y * h))
+    if not xs or not ys:
+        return None
+    return min(xs), min(ys), max(xs), max(ys)
+
+def draw_box(image, box, color):
+    if box:
+        cv2.rectangle(image, box[:2], box[2:], color, 2)
+
+def run_progressive_overlay():
+    global overlay_enabled, trails_enabled, box_opacity, trail_length, visible_group_count
+
+    cap = cv2.VideoCapture(0)
+    with mp_holistic.Holistic(static_image_mode=False) as holistic:
+        while cap.isOpened():
+            success, frame = cap.read()
+            if not success:
+                break
+
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = holistic.process(frame_rgb)
+            overlay = frame.copy()
+
+            active_groups = RANKED_GROUPS[:visible_group_count]
+
+            if results.pose_landmarks:
+                pose_landmarks = results.pose_landmarks.landmark
+                for name in active_groups:
+                    indices = GROUPS.get(name, [])
+                    box = get_group_box(pose_landmarks, indices, frame.shape)
+                    if overlay_enabled and box:
+                        draw_box(overlay, box, GROUP_COLORS.get(name, (255, 255, 255)))
+                    landmark_history[name].append(box)
+            else:
+                for name in active_groups:
+                    landmark_history[name].append(None)
+
+            if trails_enabled:
+                for name in active_groups:
+                    for past_box in landmark_history[name]:
+                        if past_box:
+                            draw_box(overlay, past_box, GROUP_COLORS.get(name, (200, 200, 200)))
+
+            blended = cv2.addWeighted(overlay, box_opacity, frame, 1 - box_opacity, 0)
+            cv2.putText(blended,
+                        f"'o'=overlay | 't'=trails | +/-=opacity | [ / ]=trail len | </>=parts ({visible_group_count}/{len(RANKED_GROUPS)}) | q=quit",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+            cv2.imshow("ECV Progressive Boxes", blended)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('o'):
+                overlay_enabled = not overlay_enabled
+            elif key == ord('t'):
+                trails_enabled = not trails_enabled
+            elif key in (ord('+'), ord('=')):
+                box_opacity = min(1.0, box_opacity + 0.1)
+            elif key in (ord('-'), ord('_')):
+                box_opacity = max(0.0, box_opacity - 0.1)
+            elif key == ord(']'):
+                trail_length = min(50, trail_length + 1)
+                for k in landmark_history:
+                    landmark_history[k] = deque(landmark_history[k], maxlen=trail_length)
+            elif key == ord('['):
+                trail_length = max(1, trail_length - 1)
+                for k in landmark_history:
+                    landmark_history[k] = deque(landmark_history[k], maxlen=trail_length)
+            elif key == ord('>') or key == ord('.'):
+                visible_group_count = min(len(RANKED_GROUPS), visible_group_count + 1)
+            elif key == ord('<') or key == ord(','):
+                visible_group_count = max(0, visible_group_count - 1)
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+run_progressive_overlay()
