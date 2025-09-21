@@ -1,0 +1,113 @@
+import cv2
+import numpy as np
+from ultralytics import YOLO
+
+# ---------------- settings ----------------
+threshold = 0.50          # initial confidence threshold (0..1)
+show_below = True         # draw below-threshold boxes faintly (gray)
+imgsz = 480               # 320 / 480 / 640 (higher = sharper, slower)
+
+# Input degradation (to provoke lower confidences)
+apply_blur = False        # 'g' to toggle Gaussian blur
+apply_downscale = False   # 'd' to toggle downscale→upscale
+noise_level = 0           # 'n'/'m' to add/remove noise (0..30)
+
+# Choose smallest YOLOv8 for speed on CPU
+from ultralytics import YOLO
+model = YOLO("/Users/johanlundgren/Desktop/Scripts/models/yolov8n.pt")
+
+def draw_box(img, xyxy, color, label, thick=2):
+    x1, y1, x2, y2 = map(int, xyxy)
+    cv2.rectangle(img, (x1, y1), (x2, y2), color, thick)
+    (tw, th), bl = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+    y_text = max(16, y1 - 6)
+    cv2.rectangle(img, (x1, y_text - th - 4), (x1 + tw + 6, y_text + 2), color, -1)
+    cv2.putText(img, label, (x1 + 3, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1, cv2.LINE_AA)
+
+def degrade(img):
+    out = img
+    if apply_blur:
+        out = cv2.GaussianBlur(out, (7,7), 0)
+    if apply_downscale:
+        h, w = out.shape[:2]
+        out = cv2.resize(out, (w//2, h//2), interpolation=cv2.INTER_LINEAR)
+        out = cv2.resize(out, (w, h), interpolation=cv2.INTER_NEAREST)
+    if noise_level > 0:
+        n = np.random.normal(0, noise_level, out.shape).astype(np.int16)
+        out = np.clip(out.astype(np.int16) + n, 0, 255).astype(np.uint8)
+    return out
+
+def main():
+    global threshold, show_below, imgsz, apply_blur, apply_downscale, noise_level
+
+    cap = cv2.VideoCapture(0)  # change to 1/2 if you use an external webcam
+    if not cap.isOpened():
+        print("Could not open camera.")
+        return
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        # Apply degradation before inference
+        inf_img = degrade(frame)
+
+        # Run model with very low internal conf so we filter ourselves
+        results = model(inf_img, imgsz=imgsz, conf=0.001, verbose=False)[0]
+        vis = frame.copy()
+        names = results.names
+
+        if results.boxes is not None:
+            for b in results.boxes:
+                conf = float(b.conf[0])
+                cls  = int(b.cls[0])
+                xyxy = b.xyxy[0].tolist()
+
+                if conf >= threshold:
+                    draw_box(vis, xyxy, (0, 255, 0), f"{names[cls]} {conf:.2f}", thick=2)
+                elif show_below:
+                    # faint gray, thin line so participants can see what's being filtered out
+                    x1, y1, x2, y2 = map(int, xyxy)
+                    cv2.rectangle(vis, (x1, y1), (x2, y2), (170,170,170), 1)
+                    cv2.putText(vis, f"{names[cls]} {conf:.2f}",
+                                (x1, max(16, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200,200,200), 1, cv2.LINE_AA)
+
+        # UI overlay
+        legend1 = f"threshold: {threshold:.2f}   show<: {'on' if show_below else 'off'}   size: {imgsz}"
+        legend2 = " +/- thr   b show<   [/] size   g blur   d downscale   n/m noise +/-   q quit"
+        cv2.putText(vis, legend1, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255,255,255), 2, cv2.LINE_AA)
+        cv2.putText(vis, legend2, (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (235,235,235), 1, cv2.LINE_AA)
+
+        cv2.imshow("Object Detection — Confidence Threshold", vis)
+        k = cv2.waitKey(1) & 0xFF
+
+        if k == ord('q'):
+            break
+        elif k in (ord('+'), ord('=')):
+            threshold = min(1.0, threshold + 0.05)
+        elif k in (ord('-'), ord('_')):
+            threshold = max(0.0, threshold - 0.05)
+        elif k == ord('b'):
+            show_below = not show_below
+        elif k == ord('['):
+            imgsz = max(320, imgsz - 160)  # 640 -> 480 -> 320
+        elif k == ord(']'):
+            imgsz = min(640, imgsz + 160)  # 320 -> 480 -> 640
+        elif k == ord('g'):
+            apply_blur = not apply_blur
+        elif k == ord('d'):
+            apply_downscale = not apply_downscale
+        elif k == ord('n'):
+            noise_level = min(30, noise_level + 5)
+        elif k == ord('m'):
+            noise_level = max(0, noise_level - 5)
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
