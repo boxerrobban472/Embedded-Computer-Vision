@@ -1,0 +1,942 @@
+#!/usr/bin/env python3
+"""
+ECV Design iPad-like Interface
+Professional Computer Vision Device with Rotary Encoders
+"""
+
+import cv2
+import requests
+import numpy as np
+import time
+import threading
+import tkinter as tk
+from tkinter import messagebox
+from PIL import Image, ImageTk
+from gpiozero import RotaryEncoder, Button
+import torch
+import os
+import mediapipe as mp
+from collections import deque
+
+# Suppress warnings
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# --- Configuration ---
+ESP32_BASE_URL = 'http://192.168.4.1'
+ESP32_STREAM_URL = f'{ESP32_BASE_URL}:81/stream'
+ESP32_CONTROL_URL = f'{ESP32_BASE_URL}/control'
+MAX_RECORD_SECONDS = 5
+
+# --- GPIO Pin Configuration ---
+ENCODER1_CLK_PIN = 22   # Model Selection + Confidence Threshold
+ENCODER1_DT_PIN = 18    
+ENCODER1_SW_PIN = 17    
+
+ENCODER2_CLK_PIN = 25   # Body Parts Overlay Control
+ENCODER2_DT_PIN = 24    
+ENCODER2_SW_PIN = 23    
+
+ENCODER3_CLK_PIN = 13   # Latency/Speed Control
+ENCODER3_DT_PIN = 6     
+ENCODER3_SW_PIN = 5     
+
+RECORD_BUTTON_PIN = 19  # Recording Control
+
+# --- Model Configurations ---
+MODELS = {
+    "MobileNet-SSD": {
+        "name": "MobileNet-SSD",
+        "description": "Fast & Lightweight",
+        "technical_info": "OpenCV DNN • 21 Classes • 300×300 Input\\nPASCAL VOC Dataset • ~6.1M Parameters",
+        "type": "opencv_dnn",
+        "config": "models/MobileNetSSD_deploy.prototxt",
+        "weights": "models/MobileNetSSD_deploy.caffemodel",
+        "input_size": (300, 300),
+        "confidence": 0.3,
+        "classes": ["background", "aeroplane", "bicycle", "bird", "boat", "bottle", "bus", "car", "cat", "chair", "cow", "diningtable", "dog", "horse", "motorbike", "person", "pottedplant", "sheep", "sofa", "train", "tvmonitor"]
+    },
+    "YOLOv5n": {
+        "name": "YOLOv5n", 
+        "description": "Balanced Performance",
+        "technical_info": "PyTorch Hub • 80 Classes • 416×416 Input\\nCOCO Dataset • ~1.9M Parameters",
+        "type": "torch_hub",
+        "model_name": "yolov5n",
+        "input_size": (416, 416),
+        "confidence": 0.25,
+        "iou": 0.45
+    },
+    "EfficientDet-Lite0": {
+        "name": "EfficientDet-Lite0",
+        "description": "Accurate & Optimized", 
+        "technical_info": "TensorFlow Lite • 80 Classes • 320×320 Input\\nCOCO Dataset • ~6.5M Parameters",
+        "type": "tflite",
+        "model_path": "models/efficientdet_lite0.tflite",
+        "input_size": (320, 320),
+        "confidence": 0.4
+    }
+}
+
+# --- MediaPipe Body Parts Configuration ---
+RANKED_GROUPS = [
+    'torso', 'head', 'left_arm', 'right_arm', 'left_hand', 'right_hand',
+    'left_leg', 'right_leg', 'left_eye', 'right_eye', 'mouth', 'chin', 'hips'
+]
+
+GROUPS = {
+    'head': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+    'left_eye': [1, 2, 3], 'right_eye': [4, 5, 6],
+    'mouth': [9, 10], 'chin': [8],
+    'left_hand': [15, 17, 19, 21], 'right_hand': [16, 18, 20, 22],
+    'left_arm': [11, 13, 15], 'right_arm': [12, 14, 16],
+    'left_leg': [23, 25, 27, 29, 31], 'right_leg': [24, 26, 28, 30, 32],
+    'torso': [11, 12, 23, 24], 'hips': [23, 24]
+}
+
+GROUP_COLORS = {
+    'head': (255, 255, 255), 'left_eye': (100, 255, 255), 'right_eye': (100, 255, 255),
+    'mouth': (255, 100, 100), 'chin': (200, 150, 150),
+    'left_hand': (0, 255, 0), 'right_hand': (0, 200, 0),
+    'left_arm': (0, 255, 255), 'right_arm': (0, 200, 200),
+    'left_leg': (255, 0, 0), 'right_leg': (200, 0, 0),
+    'torso': (255, 255, 0), 'hips': (150, 150, 0)
+}
+
+class ECVIpadInterface:
+    def __init__(self):
+        # Initialize tkinter for 7" screen
+        self.root = tk.Tk()
+        self.root.title("ECV Computer Vision Device")
+        self.root.geometry("800x480")  # Perfect for 7" Pi screen
+        self.root.configure(bg='#f8f9fa')
+        
+        # State management
+        self.in_menu = True
+        self.selected_model_index = 0
+        self.current_model_index = 0
+        
+        # Stream state
+        self.stream_running = False
+        self.stream_thread = None
+        self.current_model = None
+        self.model_loaded = False
+        
+        # Recording state
+        self.is_recording = False
+        self.is_playing = False
+        self.frames = []
+        self.recording_start_time = 0
+        self.playback_index = 0
+        self.playback_speed = 1.0
+        self.frame_skip_counter = 0
+        
+        # Overlay controls (independent)
+        self.confidence_threshold = 0.3  # Encoder 1
+        self.confidence_active = False
+        self.body_parts_count = 0        # Encoder 2 
+        self.body_parts_active = False
+        self.latency_frames = 0          # Encoder 3 (live) / speed (playback)
+        self.latency_active = False
+        
+        # MediaPipe
+        self.mp_pose = mp.solutions.pose
+        self.pose_detector = None
+        self.landmark_history = {k: deque(maxlen=30) for k in GROUPS}
+        
+        # Frame processing
+        self.frame_buffer = deque()
+        self.current_frame = None
+        
+        # GPIO
+        self.encoder1 = None
+        self.encoder2 = None
+        self.encoder3 = None
+        self.button1 = None
+        self.button2 = None
+        self.button3 = None
+        self.record_button = None
+        self.last_button_times = [0, 0, 0, 0]
+        self.debounce_time = 0.3
+        
+        # GUI components
+        self.model_frames = {}
+        self.video_label = None
+        self.stream_window = None
+        
+        # Initialize
+        self.setup_gui()
+        self.setup_gpio()
+        
+    def setup_gui(self):
+        """Setup main menu for 7\" screen"""
+        # Header
+        header_frame = tk.Frame(self.root, bg='#f8f9fa')
+        header_frame.pack(fill=tk.X, padx=30, pady=20)
+        
+        title = tk.Label(header_frame, text="Computer Vision Explorer", 
+                        font=('Arial', 28, 'bold'), fg='#2c3e50', bg='#f8f9fa')
+        title.pack()
+        
+        subtitle = tk.Label(header_frame, text="Choose your detection model", 
+                           font=('Arial', 16), fg='#6c757d', bg='#f8f9fa')
+        subtitle.pack(pady=(5, 0))
+        
+        # Model selection cards
+        models_frame = tk.Frame(self.root, bg='#f8f9fa')
+        models_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        
+        # Create model cards in horizontal layout
+        cards_container = tk.Frame(models_frame, bg='#f8f9fa')
+        cards_container.pack(fill=tk.BOTH, expand=True)
+        
+        model_keys = list(MODELS.keys())
+        for i, (key, model) in enumerate(MODELS.items()):
+            # Model card
+            card_frame = tk.Frame(cards_container, bg='#ffffff', relief=tk.RIDGE, bd=2)
+            card_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+            
+            # Card content
+            content_frame = tk.Frame(card_frame, bg='#ffffff')
+            content_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+            
+            # Model name
+            name_label = tk.Label(content_frame, text=model['name'], 
+                                 font=('Arial', 18, 'bold'), fg='#2c3e50', bg='#ffffff')
+            name_label.pack(pady=(0, 8))
+            
+            # Description
+            desc_label = tk.Label(content_frame, text=model['description'], 
+                                 font=('Arial', 14, 'normal'), fg='#28a745', bg='#ffffff')
+            desc_label.pack(pady=(0, 8))
+            
+            # Technical info
+            tech_label = tk.Label(content_frame, text=model['technical_info'], 
+                                 font=('Arial', 10, 'normal'), fg='#6c757d', bg='#ffffff',
+                                 wraplength=220, justify=tk.CENTER)
+            tech_label.pack()
+            
+            self.model_frames[key] = {
+                'card': card_frame,
+                'name': name_label,
+                'desc': desc_label,
+                'tech': tech_label
+            }
+        
+        # Instructions
+        instructions_frame = tk.Frame(self.root, bg='#f8f9fa')
+        instructions_frame.pack(fill=tk.X, padx=30, pady=(0, 30))
+        
+        instructions = tk.Label(instructions_frame, 
+                               text="🔄 Encoder 1: Navigate • 🔘 Press to Select • 🔴 Red Button to Start",
+                               font=('Arial', 14), fg='#495057', bg='#f8f9fa')
+        instructions.pack()
+        
+        # Status
+        self.status_label = tk.Label(instructions_frame, text="Select a model to begin", 
+                                    font=('Arial', 12), fg='#6c757d', bg='#f8f9fa')
+        self.status_label.pack(pady=(10, 0))
+        
+        # Update display
+        self.update_model_selection()
+        
+        # Stream window
+        self.setup_stream_window()
+        
+    def setup_stream_window(self):
+        """Setup stream display window"""
+        self.stream_window = tk.Toplevel(self.root)
+        self.stream_window.title("Live Computer Vision")
+        self.stream_window.geometry("800x600")
+        self.stream_window.configure(bg='#2c3e50')
+        self.stream_window.withdraw()
+        
+        # Video display
+        self.video_label = tk.Label(self.stream_window, bg='#2c3e50')
+        self.video_label.pack(padx=10, pady=10)
+        
+        # Stream controls
+        controls_frame = tk.Frame(self.stream_window, bg='#2c3e50')
+        controls_frame.pack(fill=tk.X, padx=20, pady=10)
+        
+        # Status display
+        self.stream_status = tk.Label(controls_frame, text="Live Stream", 
+                                     font=('Arial', 14, 'bold'), fg='#e74c3c', bg='#2c3e50')
+        self.stream_status.pack(pady=5)
+        
+        # Model display
+        self.model_display = tk.Label(controls_frame, font=('Arial', 12), fg='#ecf0f1', bg='#2c3e50')
+        self.model_display.pack(pady=5)
+        
+        # Overlay status
+        self.overlay_frame = tk.Frame(controls_frame, bg='#2c3e50')
+        self.overlay_frame.pack(pady=10)
+        
+        self.confidence_label = tk.Label(self.overlay_frame, text="Confidence: OFF", 
+                                        font=('Arial', 10, 'bold'), fg='#2ecc71', bg='#2c3e50')
+        self.confidence_label.pack(anchor=tk.W)
+        
+        self.body_parts_label = tk.Label(self.overlay_frame, text="Body Parts: OFF", 
+                                        font=('Arial', 10, 'bold'), fg='#f39c12', bg='#2c3e50')
+        self.body_parts_label.pack(anchor=tk.W)
+        
+        self.latency_label = tk.Label(self.overlay_frame, text="Latency: OFF", 
+                                     font=('Arial', 10, 'bold'), fg='#e74c3c', bg='#2c3e50')
+        self.latency_label.pack(anchor=tk.W)
+        
+        # Instructions
+        instructions = tk.Label(controls_frame, 
+                               text="🔄 Encoders: Adjust • 🔘 Press to Toggle • 🔴 Record",
+                               font=('Arial', 10), fg='#bdc3c7', bg='#2c3e50')
+        instructions.pack(pady=10)
+        
+        self.stream_window.protocol("WM_DELETE_WINDOW", self.return_to_menu)
+        
+    def setup_gpio(self):
+        """Initialize GPIO"""
+        try:
+            # Encoders
+            self.encoder1 = RotaryEncoder(a=ENCODER1_CLK_PIN, b=ENCODER1_DT_PIN, max_steps=0)
+            self.encoder2 = RotaryEncoder(a=ENCODER2_CLK_PIN, b=ENCODER2_DT_PIN, max_steps=0)
+            self.encoder3 = RotaryEncoder(a=ENCODER3_CLK_PIN, b=ENCODER3_DT_PIN, max_steps=0)
+            
+            # Buttons
+            self.button1 = Button(ENCODER1_SW_PIN)
+            self.button2 = Button(ENCODER2_SW_PIN)
+            self.button3 = Button(ENCODER3_SW_PIN)
+            self.record_button = Button(RECORD_BUTTON_PIN)
+            
+            # Event handlers
+            self.encoder1.when_rotated_clockwise = lambda: self.on_encoder_rotation(0, 1)
+            self.encoder1.when_rotated_counter_clockwise = lambda: self.on_encoder_rotation(0, -1)
+            self.button1.when_pressed = lambda: self.on_button_pressed(0)
+            
+            self.encoder2.when_rotated_clockwise = lambda: self.on_encoder_rotation(1, 1)
+            self.encoder2.when_rotated_counter_clockwise = lambda: self.on_encoder_rotation(1, -1)
+            self.button2.when_pressed = lambda: self.on_button_pressed(1)
+            
+            self.encoder3.when_rotated_clockwise = lambda: self.on_encoder_rotation(2, 1)
+            self.encoder3.when_rotated_counter_clockwise = lambda: self.on_encoder_rotation(2, -1)
+            self.button3.when_pressed = lambda: self.on_button_pressed(2)
+            
+            self.record_button.when_pressed = self.on_record_button_pressed
+            
+            print("✅ GPIO initialized successfully")
+            return True
+            
+        except Exception as e:
+            print(f"❌ GPIO setup error: {e}")
+            messagebox.showwarning("GPIO Warning", f"GPIO setup failed: {e}")
+            return False
+            
+    def on_encoder_rotation(self, encoder_id, direction):
+        """Handle encoder rotation"""
+        if self.in_menu and encoder_id == 0:
+            # Model navigation
+            model_count = len(MODELS)
+            self.current_model_index = (self.current_model_index + direction) % model_count
+            if self.current_model_index < 0:
+                self.current_model_index = model_count - 1
+            self.update_model_selection()
+            
+        elif not self.in_menu:
+            # Stream controls
+            if encoder_id == 0:
+                # Confidence threshold (0.1 - 0.9)
+                self.confidence_threshold = max(0.1, min(0.9, self.confidence_threshold + direction * 0.05))
+                print(f"🎛️ Confidence: {self.confidence_threshold:.2f}")
+                
+            elif encoder_id == 1:
+                # Body parts count (0 - 13)
+                self.body_parts_count = max(0, min(len(RANKED_GROUPS), self.body_parts_count + direction))
+                print(f"🎛️ Body Parts: {self.body_parts_count}/{len(RANKED_GROUPS)}")
+                
+            elif encoder_id == 2:
+                # Latency frames or playback speed
+                if self.is_playing:
+                    # Playback speed (0.25x - 4.0x)
+                    speed_step = 0.25
+                    self.playback_speed = max(0.25, min(4.0, self.playback_speed + direction * speed_step))
+                    print(f"🎛️ Playback Speed: {self.playback_speed:.2f}x")
+                else:
+                    # Latency frames (0 - 30)
+                    self.latency_frames = max(0, min(30, self.latency_frames + direction))
+                    print(f"🎛️ Latency: {self.latency_frames} frames")
+                    
+            self.update_overlay_display()
+            
+    def on_button_pressed(self, button_id):
+        """Handle button presses with debouncing"""
+        current_time = time.time()
+        if current_time - self.last_button_times[button_id] < self.debounce_time:
+            return
+        self.last_button_times[button_id] = current_time
+        
+        if self.in_menu and button_id == 0:
+            # Select model
+            self.selected_model_index = self.current_model_index
+            model_keys = list(MODELS.keys())
+            model_name = model_keys[self.selected_model_index]
+            print(f"✅ Selected: {model_name}")
+            self.status_label.config(text=f"Selected: {model_name}")
+            self.update_model_selection()
+            
+        elif not self.in_menu:
+            # Toggle overlays
+            if button_id == 0:
+                self.confidence_active = not self.confidence_active
+                print(f"🔄 Confidence: {'ON' if self.confidence_active else 'OFF'}")
+            elif button_id == 1:
+                self.body_parts_active = not self.body_parts_active
+                print(f"🔄 Body Parts: {'ON' if self.body_parts_active else 'OFF'}")
+                # Clear history when toggling
+                for group in self.landmark_history:
+                    self.landmark_history[group].clear()
+            elif button_id == 2:
+                self.latency_active = not self.latency_active
+                print(f"🔄 Latency/Speed: {'ON' if self.latency_active else 'OFF'}")
+                # Clear buffer when toggling latency
+                if not self.latency_active:
+                    self.frame_buffer.clear()
+                    
+            self.update_overlay_display()
+            
+    def on_record_button_pressed(self):
+        """Handle recording button"""
+        current_time = time.time()
+        if current_time - self.last_button_times[3] < self.debounce_time:
+            return
+        self.last_button_times[3] = current_time
+        
+        if self.in_menu:
+            # Start stream
+            self.start_stream()
+        else:
+            # Recording controls
+            if not self.is_recording and not self.is_playing:
+                # Start recording
+                self.is_recording = True
+                self.frames = []
+                self.recording_start_time = time.time()
+                print("🔴 Recording started (5s max)")
+                
+            elif self.is_recording:
+                # Stop recording, start playback
+                self.is_recording = False
+                if self.frames:
+                    self.is_playing = True
+                    self.playback_index = 0
+                    print(f"▶️ Playing back {len(self.frames)} frames")
+                    
+            elif self.is_playing:
+                # Stop playback, return to live
+                self.is_playing = False
+                self.frames = []
+                print("📺 Back to live stream")
+                
+    def update_model_selection(self):
+        """Update model selection display"""
+        model_keys = list(MODELS.keys())
+        
+        for i, (key, widgets) in enumerate(self.model_frames.items()):
+            card = widgets['card']
+            name_label = widgets['name']
+            desc_label = widgets['desc']
+            
+            if i == self.selected_model_index:
+                # Selected (green)
+                card.configure(bg='#d4edda', relief=tk.RIDGE, bd=3)
+                name_label.configure(bg='#d4edda', fg='#155724')
+                desc_label.configure(bg='#d4edda', fg='#155724')
+                widgets['tech'].configure(bg='#d4edda')
+                
+            elif i == self.current_model_index:
+                # Current navigation (blue)
+                card.configure(bg='#d1ecf1', relief=tk.RIDGE, bd=2)
+                name_label.configure(bg='#d1ecf1', fg='#0c5460')
+                desc_label.configure(bg='#d1ecf1', fg='#0c5460')
+                widgets['tech'].configure(bg='#d1ecf1')
+                
+            else:
+                # Normal
+                card.configure(bg='#ffffff', relief=tk.RIDGE, bd=2)
+                name_label.configure(bg='#ffffff', fg='#2c3e50')
+                desc_label.configure(bg='#ffffff', fg='#28a745')
+                widgets['tech'].configure(bg='#ffffff')
+                
+    def start_stream(self):
+        """Start the computer vision stream"""
+        print("🚀 Starting stream...")
+        
+        # Set ESP32 to optimal resolution
+        try:
+            response = requests.get(f"{ESP32_CONTROL_URL}?var=framesize&val=5", timeout=5)  # QVGA
+            if response.status_code == 200:
+                print("✅ ESP32 set to QVGA (320x240)")
+            else:
+                print(f"⚠️ ESP32 response: {response.status_code}")
+        except Exception as e:
+            print(f"⚠️ ESP32 setting error: {e}")
+            
+        # Load selected model
+        if not self.load_selected_model():
+            messagebox.showerror("Error", "Failed to load model")
+            return
+            
+        # Initialize MediaPipe
+        self.pose_detector = self.mp_pose.Pose(
+            static_image_mode=False,
+            model_complexity=1,
+            enable_segmentation=False,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        
+        # Switch to stream view
+        self.root.withdraw()
+        self.stream_window.deiconify()
+        self.in_menu = False
+        
+        # Update display
+        model_keys = list(MODELS.keys())
+        model_name = model_keys[self.selected_model_index]
+        self.model_display.config(text=f"{model_name} @ QVGA (320×240)")
+        self.update_overlay_display()
+        
+        # Start stream
+        self.stream_running = True
+        self.stream_thread = threading.Thread(target=self.run_stream, daemon=True)
+        self.stream_thread.start()
+        
+    def load_selected_model(self):
+        """Load the selected detection model"""
+        model_keys = list(MODELS.keys())
+        model_config = MODELS[model_keys[self.selected_model_index]]
+        
+        try:
+            if model_config['type'] == 'torch_hub':
+                print(f"Loading {model_config['name']}...")
+                self.current_model = torch.hub.load('ultralytics/yolov5', model_config['model_name'], pretrained=True)
+                self.current_model.conf = model_config['confidence']
+                self.current_model.iou = model_config['iou']
+                
+            elif model_config['type'] == 'opencv_dnn':
+                print(f"Loading {model_config['name']}...")
+                net = cv2.dnn.readNetFromCaffe(model_config['config'], model_config['weights'])
+                self.current_model = {
+                    'net': net,
+                    'config': model_config,
+                    'type': 'mobilenet'
+                }
+                
+            elif model_config['type'] == 'tflite':
+                print(f"Loading {model_config['name']}...")
+                # For now, fallback to YOLOv5n if TFLite not available
+                print("Using YOLOv5n fallback...")
+                self.current_model = torch.hub.load('ultralytics/yolov5', 'yolov5n', pretrained=True)
+                self.current_model.conf = 0.4
+                
+            self.model_loaded = True
+            print(f"✅ {model_config['name']} loaded successfully")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Model loading failed: {e}")
+            return False
+
+    def run_stream(self):
+        """Main stream processing loop - Fast multipart MJPEG parser"""
+        print("🔗 Connecting to ESP32 stream...")
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36',
+            'Accept': '*/*',
+            'Connection': 'keep-alive',
+            'Cache-Control': 'no-cache',
+        }
+        
+        try:
+            response = requests.get(ESP32_STREAM_URL, headers=headers, stream=True, timeout=10)
+            response.raise_for_status()
+            
+            content_type = response.headers.get('content-type', '')
+            print(f"✅ Connected! Content-Type: {content_type}")
+            
+            # Extract boundary
+            boundary = None
+            if 'boundary=' in content_type:
+                boundary = content_type.split('boundary=')[1].strip()
+                print(f"🔄 Using boundary: {boundary}")
+            else:
+                print("❌ No boundary found")
+                self.root.after(0, self.return_to_menu)
+                return
+            
+            # Process stream
+            boundary_bytes = f"--{boundary}".encode()
+            frame_count = 0
+            buffer = b''
+            start_time = time.time()
+            
+            for chunk in response.iter_content(chunk_size=4096):
+                if not chunk or not self.stream_running:
+                    break
+                    
+                buffer += chunk
+                
+                # Process complete frames
+                while boundary_bytes in buffer:
+                    boundary_pos = buffer.find(boundary_bytes)
+                    if boundary_pos == -1:
+                        break
+                    
+                    next_boundary = buffer.find(boundary_bytes, boundary_pos + len(boundary_bytes))
+                    if next_boundary == -1:
+                        break
+                    
+                    # Extract frame
+                    frame_data = buffer[boundary_pos:next_boundary]
+                    buffer = buffer[next_boundary:]
+                    
+                    try:
+                        # Find JPEG data after headers
+                        header_end = frame_data.find(b'\r\n\r\n')
+                        if header_end == -1:
+                            continue
+                        
+                        jpeg_data = frame_data[header_end + 4:]
+                        if len(jpeg_data) < 1000:
+                            continue
+                        
+                        # Decode JPEG
+                        img = cv2.imdecode(np.frombuffer(jpeg_data, np.uint8), cv2.IMREAD_COLOR)
+                        
+                        if img is not None and img.size > 0:
+                            frame_count += 1
+                            
+                            # Calculate FPS
+                            if frame_count % 60 == 0:
+                                elapsed = time.time() - start_time
+                                fps = frame_count / elapsed if elapsed > 0 else 0
+                                print(f"📹 Frame {frame_count}, FPS: {fps:.1f}")
+                            
+                            # Process frame
+                            self.process_frame(img)
+                            
+                    except Exception as e:
+                        print(f"Frame processing error: {e}")
+                
+                # Prevent buffer overflow
+                if len(buffer) > 200000:
+                    buffer = buffer[-100000:]
+                    
+        except requests.exceptions.RequestException as e:
+            print(f"❌ Connection error: {e}")
+            self.root.after(0, lambda: messagebox.showerror("Stream Error", f"Connection failed: {e}"))
+            self.root.after(0, self.return_to_menu)
+        except Exception as e:
+            print(f"❌ Stream error: {e}")
+            self.root.after(0, self.return_to_menu)
+            
+    def process_frame(self, img):
+        """Process each frame with independent overlay controls"""
+        # Handle recording
+        if self.is_recording:
+            if time.time() - self.recording_start_time < MAX_RECORD_SECONDS:
+                self.frames.append(img.copy())
+            else:
+                # Auto-stop after 5 seconds
+                self.is_recording = False
+                if self.frames:
+                    self.is_playing = True
+                    self.playback_index = 0
+                    print(f"⏱️ Auto-stopped recording - playing back {len(self.frames)} frames")
+                    
+        # Handle playback
+        if self.is_playing:
+            if self.frames and self.playback_index < len(self.frames):
+                img = self.frames[self.playback_index].copy()
+                
+                # Handle playback speed
+                if self.latency_active:
+                    self.frame_skip_counter += self.playback_speed
+                    if self.frame_skip_counter >= 1.0:
+                        frames_to_advance = int(self.frame_skip_counter)
+                        self.playback_index = (self.playback_index + frames_to_advance) % len(self.frames)
+                        self.frame_skip_counter -= frames_to_advance
+                else:
+                    # Normal speed when latency not active
+                    self.playback_index = (self.playback_index + 1) % len(self.frames)
+            else:
+                self.is_playing = False
+                self.frames = []
+                
+        # Apply independent overlays
+        processed_img = img.copy()
+        
+        # Object detection overlay (Encoder 1)
+        if self.confidence_active and self.model_loaded:
+            processed_img = self.apply_object_detection(processed_img)
+            
+        # Body parts overlay (Encoder 2)  
+        if self.body_parts_active and self.body_parts_count > 0:
+            processed_img = self.apply_body_parts_overlay(processed_img)
+            
+        # Latency/Speed overlay (Encoder 3)
+        if self.latency_active:
+            if self.is_playing:
+                # Show playback speed info
+                cv2.putText(processed_img, f'Speed: {self.playback_speed:.2f}x', 
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                self.display_frame(processed_img)
+            else:
+                # Apply latency effect
+                self.apply_latency_effect(processed_img)
+        else:
+            # Display immediately
+            self.display_frame(processed_img)
+            
+    def apply_object_detection(self, img):
+        """Apply object detection based on selected model"""
+        try:
+            model_keys = list(MODELS.keys())
+            model_config = MODELS[model_keys[self.selected_model_index]]
+            
+            if model_config['type'] == 'torch_hub' and hasattr(self.current_model, 'conf'):
+                # YOLO detection
+                self.current_model.conf = self.confidence_threshold
+                results = self.current_model(img)
+                detections = results.pandas().xyxy[0]
+                
+                for _, detection in detections.iterrows():
+                    if detection['confidence'] >= self.confidence_threshold:
+                        x1, y1, x2, y2 = int(detection['xmin']), int(detection['ymin']), int(detection['xmax']), int(detection['ymax'])
+                        label = f"{detection['name']} {detection['confidence']:.2f}"
+                        
+                        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        cv2.putText(img, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                        
+            elif model_config['type'] == 'opencv_dnn':
+                # MobileNet-SSD detection
+                blob = cv2.dnn.blobFromImage(img, 0.007843, (300, 300), 127.5)
+                self.current_model['net'].setInput(blob)
+                detections = self.current_model['net'].forward()
+                
+                h, w = img.shape[:2]
+                for i in range(detections.shape[2]):
+                    confidence = detections[0, 0, i, 2]
+                    if confidence >= self.confidence_threshold:
+                        class_id = int(detections[0, 0, i, 1])
+                        if class_id < len(model_config['classes']):
+                            label = f"{model_config['classes'][class_id]} {confidence:.2f}"
+                            
+                            box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+                            x1, y1, x2, y2 = box.astype(int)
+                            
+                            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                            cv2.putText(img, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                            
+        except Exception as e:
+            print(f"Object detection error: {e}")
+            
+        return img
+        
+    def apply_body_parts_overlay(self, img):
+        """Apply MediaPipe body parts overlay"""
+        try:
+            if not self.pose_detector:
+                return img
+                
+            # Process with MediaPipe
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            results = self.pose_detector.process(img_rgb)
+            
+            if results.pose_landmarks:
+                pose_landmarks = results.pose_landmarks.landmark
+                
+                # Get active groups based on encoder value
+                active_groups = RANKED_GROUPS[:self.body_parts_count]
+                
+                # Draw bounding boxes for each active group
+                for group_name in active_groups:
+                    if group_name in GROUPS:
+                        box = self.get_group_bounding_box(pose_landmarks, GROUPS[group_name], img.shape)
+                        if box:
+                            color = GROUP_COLORS.get(group_name, (255, 255, 255))
+                            
+                            # Draw bounding box
+                            cv2.rectangle(img, (box[0], box[1]), (box[2], box[3]), color, 2)
+                            
+                            # Draw label
+                            label_text = group_name.replace('_', ' ').title()
+                            cv2.putText(img, label_text, (box[0], box[1]-10), 
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                            
+        except Exception as e:
+            print(f"Body parts overlay error: {e}")
+            
+        return img
+        
+    def get_group_bounding_box(self, landmarks, indices, image_shape):
+        """Calculate bounding box for landmark group"""
+        try:
+            h, w, _ = image_shape
+            xs, ys = [], []
+            
+            for idx in indices:
+                if idx < len(landmarks):
+                    lm = landmarks[idx]
+                    if hasattr(lm, 'visibility') and lm.visibility < 0.5:
+                        continue
+                    xs.append(int(lm.x * w))
+                    ys.append(int(lm.y * h))
+                    
+            if not xs or not ys:
+                return None
+                
+            # Add padding
+            padding = 10
+            x_min = max(0, min(xs) - padding)
+            y_min = max(0, min(ys) - padding)  
+            x_max = min(w, max(xs) + padding)
+            y_max = min(h, max(ys) + padding)
+            
+            return (x_min, y_min, x_max, y_max)
+            
+        except Exception as e:
+            print(f"Bounding box error: {e}")
+            return None
+            
+    def apply_latency_effect(self, frame):
+        """Apply latency delay effect"""
+        try:
+            # Manage buffer size
+            while len(self.frame_buffer) > self.latency_frames:
+                self.frame_buffer.popleft()
+            
+            # Add current frame
+            self.frame_buffer.append(frame.copy())
+            
+            # Show delayed frame
+            if len(self.frame_buffer) > self.latency_frames and self.latency_frames > 0:
+                delayed_frame = self.frame_buffer.popleft()
+            else:
+                delayed_frame = frame.copy()
+                
+            # Show latency info
+            cv2.putText(delayed_frame, f'Latency: {self.latency_frames} frames',
+                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            
+            self.display_frame(delayed_frame)
+            
+        except Exception as e:
+            print(f"Latency effect error: {e}")
+            
+    def display_frame(self, frame):
+        """Display frame in GUI"""
+        try:
+            # Resize for display
+            display_img = cv2.resize(frame, (640, 480))
+            
+            # Convert to tkinter format
+            img_rgb = cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB)
+            img_pil = Image.fromarray(img_rgb)
+            img_tk = ImageTk.PhotoImage(img_pil)
+            
+            # Update GUI in main thread
+            self.root.after(0, self.update_video_display, img_tk)
+            
+        except Exception as e:
+            print(f"Display error: {e}")
+    
+    def update_video_display(self, img_tk):
+        """Update video display in main thread"""
+        if self.video_label and self.stream_running:
+            self.video_label.configure(image=img_tk)
+            self.video_label.image = img_tk
+            
+    def update_overlay_display(self):
+        """Update overlay status display"""
+        # Confidence
+        if self.confidence_active:
+            self.confidence_label.config(text=f"Confidence: ON ({self.confidence_threshold:.2f})")
+        else:
+            self.confidence_label.config(text="Confidence: OFF")
+            
+        # Body Parts
+        if self.body_parts_active:
+            self.body_parts_label.config(text=f"Body Parts: ON ({self.body_parts_count}/{len(RANKED_GROUPS)})")
+        else:
+            self.body_parts_label.config(text="Body Parts: OFF")
+            
+        # Latency/Speed
+        if self.is_playing:
+            if self.latency_active:
+                self.latency_label.config(text=f"Speed: ON ({self.playback_speed:.2f}x)")
+            else:
+                self.latency_label.config(text="Speed: OFF (1.0x)")
+        else:
+            if self.latency_active:
+                self.latency_label.config(text=f"Latency: ON ({self.latency_frames} frames)")
+            else:
+                self.latency_label.config(text="Latency: OFF")
+                
+        # Recording status
+        if self.is_recording:
+            remaining = MAX_RECORD_SECONDS - (time.time() - self.recording_start_time)
+            self.stream_status.config(text=f"🔴 Recording ({remaining:.1f}s left)")
+        elif self.is_playing:
+            self.stream_status.config(text="▶️ Playing Recording")
+        else:
+            self.stream_status.config(text="📹 Live Stream")
+            
+    def return_to_menu(self):
+        """Return to model selection menu"""
+        print("📋 Returning to menu...")
+        
+        # Stop stream
+        self.stream_running = False
+        self.is_recording = False
+        self.is_playing = False
+        self.frames = []
+        
+        # Clear buffers
+        self.frame_buffer.clear()
+        for group in self.landmark_history:
+            self.landmark_history[group].clear()
+            
+        # Reset states
+        self.confidence_active = False
+        self.body_parts_active = False
+        self.latency_active = False
+        self.playback_speed = 1.0
+        
+        # Switch windows
+        self.stream_window.withdraw()
+        self.root.deiconify()
+        self.in_menu = True
+        
+    def run(self):
+        """Start the application"""
+        print("🎛️ Starting ECV iPad Interface")
+        self.root.mainloop()
+        
+    def cleanup(self):
+        """Clean up resources"""
+        self.stream_running = False
+        try:
+            if self.encoder1: self.encoder1.close()
+            if self.encoder2: self.encoder2.close()
+            if self.encoder3: self.encoder3.close()
+            if self.button1: self.button1.close()
+            if self.button2: self.button2.close()
+            if self.button3: self.button3.close()
+            if self.record_button: self.record_button.close()
+        except Exception as e:
+            print(f"Cleanup warning: {e}")
+
+if __name__ == '__main__':
+    interface = ECVIpadInterface()
+    try:
+        interface.run()
+    finally:
+        interface.cleanup()
