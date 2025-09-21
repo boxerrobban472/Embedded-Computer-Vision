@@ -1,0 +1,119 @@
+import cv2
+import mediapipe as mp
+import random
+
+# Initialize MediaPipe Pose
+mp_pose = mp.solutions.pose
+pose = mp_pose.Pose()
+
+# Start video capture
+cap = cv2.VideoCapture(0)
+
+# Jitter intensity: how much noise to add (in pixels)
+jitter_intensity = 0  # Start with no jitter
+
+def apply_jitter(x, y, intensity):
+    dx = random.uniform(-intensity, intensity)
+    dy = random.uniform(-intensity, intensity)
+    return int(x + dx), int(y + dy)
+
+print("Press '+' to increase jitter, '-' to decrease jitter, 'q' to quit.")
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    # Get frame dimensions
+    h, w, _ = frame.shape
+
+    # Convert to RGB for MediaPipe
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = pose.process(frame_rgb)
+
+    # Draw landmarks with jitter
+    if results.pose_landmarks:
+        for lm in results.pose_landmarks.landmark:
+            x = int(lm.x * w)
+            y = int(lm.y * h)
+            x_j, y_j = apply_jitter(x, y, jitter_intensity)
+            cv2.circle(frame, (x_j, y_j), 5, (0, 255, 0), -1)
+
+    # Display jitter intensity
+    cv2.putText(frame, f'Jitter: {jitter_intensity}px', (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+    cv2.imshow('Jitter Simulation', frame)
+
+    # Handle keypresses
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
+        break
+    elif key == ord('+') or key == ord('='):
+        jitter_intensity += 1
+    elif key == ord('-') and jitter_intensity > 0:
+        jitter_intensity -= 1
+
+cap.release()
+cv2.destroyAllWindows()
+
+Latency: import cv2
+import mediapipe as mp
+from collections import deque
+
+# Initialize MediaPipe Pose
+mp_pose = mp.solutions.pose
+pose = mp_pose.Pose()
+
+# Start video capture
+cap = cv2.VideoCapture(0)
+
+# Buffer to store delayed frames
+frame_buffer = deque()
+latency_frames = 0  # How many frames to delay
+
+print("Press '+' to increase latency, '-' to decrease, 'q' to quit.")
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    h, w, _ = frame.shape
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = pose.process(frame_rgb)
+
+    # Draw pose on the frame
+    output_frame = frame.copy()
+
+    if results.pose_landmarks:
+        for lm in results.pose_landmarks.landmark:
+            x, y = int(lm.x * w), int(lm.y * h)
+            cv2.circle(output_frame, (x, y), 5, (255, 0, 0), -1)
+
+    # Add current processed frame to buffer
+    frame_buffer.append(output_frame)
+
+    # Show frame from buffer (simulate latency)
+    if len(frame_buffer) > latency_frames:
+        delayed_frame = frame_buffer.popleft()
+    else:
+        delayed_frame = frame.copy()
+
+    # Display latency value
+    cv2.putText(delayed_frame, f'Latency: {latency_frames} frame(s)',
+                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+    cv2.imshow('Latency Demo', delayed_frame)
+
+    # Keyboard controls
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
+        break
+    elif key == ord('+') or key == ord('='):
+        latency_frames = min(latency_frames + 1, 60)
+    elif key == ord('-') and latency_frames > 0:
+        latency_frames -= 1
+
+cap.release()
+cv2.destroyAllWindows()
